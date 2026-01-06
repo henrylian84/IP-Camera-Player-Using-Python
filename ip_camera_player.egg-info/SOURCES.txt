@@ -1,0 +1,7 @@
+LICENSE
+README.md
+pyproject.toml
+ip_camera_player.egg-info/PKG-INFO
+ip_camera_player.egg-info/SOURCES.txt
+ip_camera_player.egg-info/dependency_links.txt
+ip_camera_player.egg-info/top_level.txt

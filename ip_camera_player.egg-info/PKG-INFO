@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: ip-camera-player
+Version: 0.1.0
+Summary: IP Camera Player Using Python
+License-File: LICENSE
+Dynamic: license-file
