@@ -1,1 +1,2 @@
-images
+camera_security
+ip_camera_player

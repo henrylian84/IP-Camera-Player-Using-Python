@@ -4,5 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ip-camera-player"
-version = "0.1.0"
+version = "1.0.0"
 description = "IP Camera Player Using Python"
+requires-python = ">=3.9"
+authors = [{ name = "Henry Lian" }]
+dependencies = [
+    "PyQt5>=5.15.0",
+    "opencv-python>=4.5.0",
+    "numpy>=1.19.0",
+]
+
+[tool.setuptools]
+py-modules = ["ip_camera_player", "camera_security"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+"*" = ["images/*"]

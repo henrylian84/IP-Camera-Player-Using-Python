@@ -299,6 +299,76 @@ class CameraInstance:
             self.stream_thread.pause_streaming(paused)
             self.state = CameraState.PAUSED if paused else CameraState.RUNNING
     
+    def change_resolution_smooth(self, new_resolution: Tuple[int, int], on_ready_callback=None) -> None:
+        """
+        Change camera resolution smoothly without disconnecting the current stream.
+        
+        This method keeps the current low-resolution stream running while starting
+        a new stream thread with the desired resolution in parallel. Once the new
+        stream is ready (first frame received), it switches to the new stream and
+        cleans up the old one.
+        
+        Args:
+            new_resolution: Target resolution as (width, height) tuple
+            on_ready_callback: Optional callback function to call when new stream is ready
+                             Signature: callback(camera_id: str) -> None
+        """
+        # If no stream is running, just change resolution normally
+        if self.stream_thread is None or not self.stream_thread.isRunning():
+            self.resolution = new_resolution
+            self.start_stream()
+            return
+        
+        # Store the old stream thread
+        old_stream_thread = self.stream_thread
+        
+        # Create new stream thread with new resolution
+        new_stream_thread = StreamThread(
+            self.get_url(),
+            new_resolution,
+            self.id,
+            self.connection_timeout
+        )
+        
+        # Create a wrapper callback to handle the transition
+        def on_new_stream_ready(camera_id: str) -> None:
+            """Called when the new stream's first frame is received."""
+            # Switch the active stream thread
+            self.stream_thread = new_stream_thread
+            self.resolution = new_resolution
+            
+            # Disconnect old stream signals and stop it
+            try:
+                old_stream_thread.first_frame_received.disconnect()
+                old_stream_thread.error_signal.disconnect()
+                old_stream_thread.frame_received.disconnect()
+            except (TypeError, RuntimeError):
+                # Signals may not be connected or already disconnected
+                pass
+            
+            # Stop the old stream thread
+            if old_stream_thread.isRunning():
+                old_stream_thread.stop_streaming()
+            
+            # Call the user's callback if provided
+            if on_ready_callback:
+                try:
+                    on_ready_callback(camera_id)
+                except Exception as e:
+                    print(f"Error in resolution change callback: {e}")
+        
+        # Connect new stream signals - need to connect frame_received to receive frames
+        # This is a workaround: we need access to the main window's _on_frame_received method
+        # For now, we'll store a reference and connect it after starting
+        new_stream_thread.first_frame_received.connect(on_new_stream_ready)
+        new_stream_thread.error_signal.connect(self._on_error)
+        
+        # Store reference to new stream thread for signal connection in main window
+        self._pending_new_stream_thread = new_stream_thread
+        
+        # Start the new stream thread (old stream still running)
+        new_stream_thread.start_streaming(self.get_url(), new_resolution)
+    
     def take_snapshot(self) -> Optional[np.ndarray]:
         """
         Capture current frame from the camera stream.
@@ -944,10 +1014,6 @@ class CameraPanel(QWidget):
     
     def show_offline_image(self) -> None:
         """Display the offline camera image."""
-        # Ensure error container is hidden (if it exists)
-        if hasattr(self, 'error_container'):
-            self.error_container.hide()
-        
         # Stop loading animation (if it exists)
         if hasattr(self, 'loading_animation'):
             self.loading_animation.stop()
@@ -987,6 +1053,13 @@ class CameraPanel(QWidget):
             message: Error message to display
         """
         if message:
+            # Stop accepting frames when an error occurs
+            self.accepting_frames = False
+            
+            # First, display the offline image as the background
+            self.show_offline_image()
+            
+            # Then display the error message on top
             self.error_label.setText(message)
             self.loading_animation.stop()
             
@@ -996,10 +1069,14 @@ class CameraPanel(QWidget):
             # Show the container after positioning
             self.error_container.show()
             
-            # Raise to top
+            # Raise to top and ensure it's visible
             self.error_container.raise_()
+            self.error_container.setVisible(True)
         else:
-            # When clearing error, hide error container and show offline image
+            # When clearing error, resume accepting frames
+            self.accepting_frames = True
+            
+            # Hide error container
             self.error_container.hide()
             # Always show offline image when clearing error (camera is stopped)
             self.show_offline_image()
@@ -3476,8 +3553,15 @@ class Windows(QMainWindow):
         if selected_camera is None:
             return
         
-        # Set resolution to 320x180 for streaming
-        selected_camera.resolution = (640, 360)
+        # Get the panel to check if it's in fullscreen mode
+        panel = self.camera_panels.get(selected_camera.id)
+        
+        # Set resolution based on fullscreen mode
+        # Use 1920x1080 (1080p) for fullscreen, 1280x720 for normal view
+        if panel and panel.is_fullscreen:
+            selected_camera.resolution = (1920, 1080)
+        else:
+            selected_camera.resolution = (1280, 720)
         
         # Show loading animation for this camera
         if selected_camera.id in self.camera_panels:
@@ -3987,13 +4071,23 @@ class Windows(QMainWindow):
             camera_id: ID of camera that encountered error
             error: Error message
         """
+        # Update camera state to ERROR
+        camera = self.camera_manager.get_camera(camera_id)
+        if camera:
+            camera.state = CameraState.ERROR
+            camera.error_message = error
+        
+        # Update panel with error message
         if camera_id in self.camera_panels:
             panel = self.camera_panels[camera_id]
             panel.set_error(error)
             panel.set_loading(False)
         
         # Update tree view indicator to show offline (red)
-        self.camera_tree_view.update_camera_state(camera_id)
+        if hasattr(self, 'camera_tree_view') and self.camera_tree_view:
+            self.camera_tree_view.update_camera_state(camera_id)
+            # Force tree to repaint
+            self.camera_tree_view.viewport().update()
     
     def _on_first_frame(self, camera_id: str) -> None:
         """
@@ -4098,7 +4192,9 @@ class Windows(QMainWindow):
         Handle fullscreen toggle for a camera panel.
         
         Toggles between fullscreen mode for the specified camera and
-        normal grid layout.
+        normal grid layout. Also adjusts streaming resolution based on mode.
+        Implements smooth resolution switching that keeps the low-resolution
+        stream running while the high-resolution stream loads.
         
         Args:
             camera_id: ID of camera to toggle fullscreen for
@@ -4107,14 +4203,35 @@ class Windows(QMainWindow):
             return
         
         panel = self.camera_panels[camera_id]
+        camera = self.camera_manager.get_camera(camera_id)
+        
+        if not camera:
+            return
         
         # Check if this panel is currently in fullscreen
         if panel.is_fullscreen:
-            # Exit fullscreen mode
+            # Exit fullscreen mode - switch to lower resolution smoothly
             panel.exit_fullscreen()
             self.camera_grid_layout.clear_fullscreen()
+            
+            # If camera is streaming, smoothly transition to lower resolution
+            if camera.state == CameraState.RUNNING:
+                # Use smooth resolution change to avoid disconnection
+                camera.change_resolution_smooth(
+                    (1280, 720),
+                    on_ready_callback=lambda cam_id: self.update_status_bar("", "", f"{camera.resolution}")
+                )
+                
+                # Connect signals to the pending new stream thread
+                if hasattr(camera, '_pending_new_stream_thread') and camera._pending_new_stream_thread:
+                    try:
+                        camera._pending_new_stream_thread.frame_received.connect(
+                            lambda cam_id, frame: self._on_frame_received(cam_id, frame)
+                        )
+                    except TypeError:
+                        pass
         else:
-            # Enter fullscreen mode
+            # Enter fullscreen mode - switch to higher resolution smoothly
             panel.enter_fullscreen()
             
             # Find the layout item for this panel
@@ -4123,6 +4240,23 @@ class Windows(QMainWindow):
                 if item and item.widget() == panel:
                     self.camera_grid_layout.set_fullscreen(item)
                     break
+            
+            # If camera is streaming, smoothly transition to higher resolution
+            if camera.state == CameraState.RUNNING:
+                # Use smooth resolution change to avoid disconnection
+                camera.change_resolution_smooth(
+                    (1920, 1080),
+                    on_ready_callback=lambda cam_id: self.update_status_bar("", "", f"{camera.resolution}")
+                )
+                
+                # Connect signals to the pending new stream thread
+                if hasattr(camera, '_pending_new_stream_thread') and camera._pending_new_stream_thread:
+                    try:
+                        camera._pending_new_stream_thread.frame_received.connect(
+                            lambda cam_id, frame: self._on_frame_received(cam_id, frame)
+                        )
+                    except TypeError:
+                        pass
     
     def handle_camera_reorder(self, source_id: str, target_id: str) -> None:
         """
